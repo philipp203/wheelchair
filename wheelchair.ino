@@ -10,7 +10,7 @@ const int M2_ENC_A = 3;       // Interrupt Pin
 // --- Constants ---
 const float EDGES_PER_REV = 1350.0;       // 90 pulses * 2 (CHANGE interrupt)
 const unsigned long PID_SAMPLE_TIME = 50; // PID updates at 20 Hz (every 50ms)
-const double WHEEL_CIRCUMFERENCE_IN = 31.416; // 10-inch wheel
+const double WHEEL_CIRCUMFERENCE_IN = 45.553; // 14.5-inch wheel
 const double MPH_PER_RPM = WHEEL_CIRCUMFERENCE_IN * 60.0 / 63360.0;
 const double MAX_SPEED_MPH = 5.0;
 const double MAX_RPM = MAX_SPEED_MPH / MPH_PER_RPM;
