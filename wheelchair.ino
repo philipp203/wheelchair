@@ -14,28 +14,28 @@ const double WHEEL_CIRCUMFERENCE_IN = 45.553; // 14.5-inch wheel
 const double MPH_PER_RPM = WHEEL_CIRCUMFERENCE_IN * 60.0 / 63360.0;
 const double MAX_SPEED_MPH = 5.0;
 const double MAX_RPM = MAX_SPEED_MPH / MPH_PER_RPM;
-const float MAX_ACCEL_MPH_PER_SEC = 0.5;  // Limit speed increases to reduce startup torque
+const double MAX_PWM_RISE_PER_SEC = 100.0; // Limit positive PWM changes; tune only with safe testing
 const unsigned long TIMEOUT_US = 200000; // 0.2 seconds timeout (If stopped, RPM = 0)
 const unsigned int LOW_SPEED_STOP_SAMPLES = 20;
 
 // --- Constraints ---
 const float MIN_ACTUAL_MPH = 0.2;        // Physical speed threshold required to activate motors
-const int MAX_PWM_LIMIT = 235;          // 70% of 255 (255 * 0.70 = 178.5)
+const int MAX_PWM_LIMIT = 235;
 
 // --- Filter Configuration ---
-const int POT_FILTER_SAMPLES = 20;       // Smooth potentiometer over 20 samples
+const int POT_FILTER_SAMPLES = 20;
 
 // --- PID Tuning Parameters ---
 double Kp = 5, Ki = 10, Kd = 0.0001;
 
 // --- PID Variables ---
-double Setpoint = 0;
-double requestedSetpointRPM = 0;
-double Input1, Output1;
-double Input2, Output2;
+double Setpoint, Input1, PIDOutput1;
+double Input2, PIDOutput2;
+double appliedPWM1 = 0;
+double appliedPWM2 = 0;
 
-PID myPID1(&Input1, &Output1, &Setpoint, Kp, Ki, Kd, DIRECT);
-PID myPID2(&Input2, &Output2, &Setpoint, Kp, Ki, Kd, DIRECT);
+PID myPID1(&Input1, &PIDOutput1, &Setpoint, Kp, Ki, Kd, DIRECT);
+PID myPID2(&Input2, &PIDOutput2, &Setpoint, Kp, Ki, Kd, DIRECT);
 
 // --- Interrupt Accumulators (Volatiles) ---
 volatile unsigned long m1_last_time = 0;
@@ -51,7 +51,7 @@ bool motorsRunning = false;
 unsigned int belowThresholdSamples = 0;
 
 // --- Potentiometer Filter Variables ---
-int pot_buffer[POT_FILTER_SAMPLES];
+int pot_buffer[POT_FILTER_SAMPLES] = {0};
 int pot_buffer_index = 0;
 long pot_total_sum = 0;
 
@@ -81,6 +81,16 @@ double median3(double a, double b, double c) {
   return c;
 }
 
+// Rate-limit upward PWM changes; allow decreases immediately.
+double limitPwmRise(double currentPWM, double requestedPWM, double maxRise) {
+  requestedPWM = constrain(requestedPWM, 0, MAX_PWM_LIMIT);
+  if (requestedPWM <= currentPWM) {
+    return requestedPWM;
+  }
+  double limitedPWM = currentPWM + maxRise;
+  return (requestedPWM < limitedPWM) ? requestedPWM : limitedPWM;
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -103,81 +113,63 @@ void setup() {
 }
 
 void loop() {
-  // 1. Read Potentiometer and map to Target RPM
+  // Read potentiometer and map it to the requested target RPM (maximum 5 mph).
   int rawPotValue = analogRead(POT_PIN);
 
   pot_total_sum -= pot_buffer[pot_buffer_index];
   pot_buffer[pot_buffer_index] = rawPotValue;
   pot_total_sum += rawPotValue;
-
   pot_buffer_index = (pot_buffer_index + 1) % POT_FILTER_SAMPLES;
 
   int potValue = pot_total_sum / POT_FILTER_SAMPLES;
-
   long targetRPMScaled = map(potValue, 0, 1023, 0, (int)(MAX_RPM * 100));
-  requestedSetpointRPM = (double)targetRPMScaled / 100.0;
+  Setpoint = (double)targetRPMScaled / 100.0;
 
   unsigned long currentMillis = millis();
   unsigned long currentMicros = micros();
 
-  // 2. Process updates every 50ms (20 Hz)
   if (currentMillis - previousMillis >= PID_SAMPLE_TIME) {
     unsigned long elapsedMillis = currentMillis - previousMillis;
     previousMillis = currentMillis;
-
-    // Ramp increases in target speed to limit startup torque.
-    // Reducing throttle is immediate.
-    double maxRPMIncrease = (MAX_ACCEL_MPH_PER_SEC / MPH_PER_RPM) * (elapsedMillis / 1000.0);
-    if (requestedSetpointRPM > Setpoint) {
-      double increase = requestedSetpointRPM - Setpoint;
-      Setpoint += (increase < maxRPMIncrease) ? increase : maxRPMIncrease;
-    } else {
-      Setpoint = requestedSetpointRPM;
-    }
+    double maxPwmRise = MAX_PWM_RISE_PER_SEC * (elapsedMillis / 1000.0);
 
     // --- Safe Copies of Interrupt Data ---
     noInterrupts();
-
     unsigned long t_duration1 = m1_total_duration;
-    unsigned int  count1      = m1_edge_count;
-    unsigned long lastTime1   = m1_last_time;
+    unsigned int count1 = m1_edge_count;
+    unsigned long lastTime1 = m1_last_time;
     m1_total_duration = 0;
     m1_edge_count = 0;
 
     unsigned long t_duration2 = m2_total_duration;
-    unsigned int  count2      = m2_edge_count;
-    unsigned long lastTime2   = m2_last_time;
+    unsigned int count2 = m2_edge_count;
+    unsigned long lastTime2 = m2_last_time;
     m2_total_duration = 0;
     m2_edge_count = 0;
-
     interrupts();
 
-    double i2 = 0, i1 = 0;
+    double i1 = 0, i2 = 0;
 
-    // --- Motor 1 Average Speed Processing ---
     if (currentMicros - lastTime1 > TIMEOUT_US || lastTime1 == 0) {
       i1 = 0;
     } else if (count1 > 0) {
-      float avg_edge_duration = (float)t_duration1 / count1;
-      i1 = 60000000.0 / (avg_edge_duration * EDGES_PER_REV);
+      double avgEdgeDuration1 = (double)t_duration1 / count1;
+      i1 = 60000000.0 / (avgEdgeDuration1 * EDGES_PER_REV);
     }
 
-    // --- Motor 2 Average Speed Processing ---
     if (currentMicros - lastTime2 > TIMEOUT_US || lastTime2 == 0) {
       i2 = 0;
     } else if (count2 > 0) {
-      float avg_edge_duration = (float)t_duration2 / count2;
-      i2 = 60000000.0 / (avg_edge_duration * EDGES_PER_REV);
+      double avgEdgeDuration2 = (double)t_duration2 / count2;
+      i2 = 60000000.0 / (avgEdgeDuration2 * EDGES_PER_REV);
     }
 
-    // --- 3-Point Median Filter Buffers ---
     static double m1_history[3] = {0, 0, 0};
     static double m2_history[3] = {0, 0, 0};
 
     m1_history[0] = m1_history[1];
     m1_history[1] = m1_history[2];
     m1_history[2] = i1;
-
     m2_history[0] = m2_history[1];
     m2_history[1] = m2_history[2];
     m2_history[2] = i2;
@@ -188,10 +180,9 @@ void loop() {
     float currentMPH1 = Input1 * MPH_PER_RPM;
     float currentMPH2 = Input2 * MPH_PER_RPM;
 
-    // Start requires both motors to be above the threshold.
-    // Once started, 20 consecutive low-speed samples are required to stop.
+    // Preserve the intentional start condition. Once running, tolerate up to
+    // 19 consecutive low-speed samples; stop on the 20th.
     bool belowThreshold = currentMPH1 < MIN_ACTUAL_MPH || currentMPH2 < MIN_ACTUAL_MPH;
-
     if (!motorsRunning) {
       if (!belowThreshold) {
         motorsRunning = true;
@@ -214,9 +205,10 @@ void loop() {
     }
 
     if (!motorsRunning) {
-      Output1 = 0;
-      Output2 = 0;
-
+      PIDOutput1 = 0;
+      PIDOutput2 = 0;
+      appliedPWM1 = 0; // Stop commands bypass the upward slew limiter.
+      appliedPWM2 = 0;
       if (myPID1.GetMode() == AUTOMATIC) {
         myPID1.SetMode(MANUAL);
         myPID2.SetMode(MANUAL);
@@ -226,16 +218,18 @@ void loop() {
     } else {
       myPID1.Compute();
       myPID2.Compute();
+      appliedPWM1 = limitPwmRise(appliedPWM1, PIDOutput1, maxPwmRise);
+      appliedPWM2 = limitPwmRise(appliedPWM2, PIDOutput2, maxPwmRise);
     }
 
-    analogWrite(M1_PWM, Output1);
-    analogWrite(M2_PWM, Output2);
+    analogWrite(M1_PWM, (int)(appliedPWM1 + 0.5));
+    analogWrite(M2_PWM, (int)(appliedPWM2 + 0.5));
 
     float targetMPH = Setpoint * MPH_PER_RPM;
     Serial.print("Target_MPH:"); Serial.print(targetMPH, 2);
     Serial.print(",M1_MPH:"); Serial.print(currentMPH1, 2);
     Serial.print(",M2_MPH:"); Serial.print(currentMPH2, 2);
-    Serial.print(",M1_PWM:"); Serial.print((float)Output1/17);
-    Serial.print(",M2_PWM:"); Serial.println((float)Output2/17);
+    Serial.print(",M1_PWM:"); Serial.print(appliedPWM1 / 17.0);
+    Serial.print(",M2_PWM:"); Serial.println(appliedPWM2 / 17.0);
   }
 }
