@@ -1,16 +1,20 @@
 #include <PID_v1.h>
 
 // --- Pin Definitions ---
-const int POT_PIN = A0;      
-const int M1_PWM = 5;        
+const int POT_PIN = A0;
+const int M1_PWM = 5;
 const int M1_ENC_A = 2;       // Interrupt Pin
-const int M2_PWM = 6;        
+const int M2_PWM = 6;
 const int M2_ENC_A = 3;       // Interrupt Pin
 
 // --- Constants ---
 const float EDGES_PER_REV = 1350.0;       // 90 pulses * 2 (CHANGE interrupt)
 const unsigned long PID_SAMPLE_TIME = 50; // PID updates at 20 Hz (every 50ms)
-const float MAX_RPM = 92.0;             // 4mph with 10-inch wheel
+const double WHEEL_CIRCUMFERENCE_IN = 31.416; // 10-inch wheel
+const double MPH_PER_RPM = WHEEL_CIRCUMFERENCE_IN * 60.0 / 63360.0;
+const double MAX_SPEED_MPH = 5.0;
+const double MAX_RPM = MAX_SPEED_MPH / MPH_PER_RPM;
+const float MAX_ACCEL_MPH_PER_SEC = 0.5;  // Limit speed increases to reduce startup torque
 const unsigned long TIMEOUT_US = 200000; // 0.2 seconds timeout (If stopped, RPM = 0)
 
 // --- Constraints ---
@@ -24,7 +28,9 @@ const int POT_FILTER_SAMPLES = 20;       // Smooth potentiometer over 20 samples
 double Kp = 5, Ki = 10, Kd = 0.0001;
 
 // --- PID Variables ---
-double Setpoint, Input1, Output1;
+double Setpoint = 0; // Slew-limited target speed, in RPM
+double requestedSetpointRPM = 0;
+double Input1, Output1;
 double Input2, Output2;
 
 PID myPID1(&Input1, &Output1, &Setpoint, Kp, Ki, Kd, DIRECT);
@@ -94,30 +100,41 @@ void setup() {
 }
 
 void loop() {
-  // 1. Read Potentiometer and map to Target RPM
+  // 1. Read Potentiometer and map to a requested target RPM (maximum 5 mph)
   int rawPotValue = analogRead(POT_PIN);
- 
+
   pot_total_sum -= pot_buffer[pot_buffer_index];
   pot_buffer[pot_buffer_index] = rawPotValue;
   pot_total_sum += rawPotValue;
- 
+
   pot_buffer_index = (pot_buffer_index + 1) % POT_FILTER_SAMPLES;
- 
+
   int potValue = pot_total_sum / POT_FILTER_SAMPLES;
 
   long targetRPMScaled = map(potValue, 0, 1023, 0, (int)(MAX_RPM * 100));
-  Setpoint = (double)targetRPMScaled / 100.0;
+  requestedSetpointRPM = (double)targetRPMScaled / 100.0;
 
   unsigned long currentMillis = millis();
   unsigned long currentMicros = micros();
- 
+
   // 2. Process updates every 50ms (20 Hz)
   if (currentMillis - previousMillis >= PID_SAMPLE_TIME) {
+    unsigned long elapsedMillis = currentMillis - previousMillis;
     previousMillis = currentMillis;
+
+    // Ramp increases in target speed to limit acceleration and startup torque.
+    // Decreases are applied immediately when the user reduces the throttle.
+    double maxRPMIncrease = (MAX_ACCEL_MPH_PER_SEC / MPH_PER_RPM) * (elapsedMillis / 1000.0);
+    if (requestedSetpointRPM > Setpoint) {
+      double increase = requestedSetpointRPM - Setpoint;
+      Setpoint += (increase < maxRPMIncrease) ? increase : maxRPMIncrease;
+    } else {
+      Setpoint = requestedSetpointRPM;
+    }
 
     // --- Safe Copies of Interrupt Data ---
     noInterrupts();
-   
+
     unsigned long t_duration1 = m1_total_duration;
     unsigned int  count1      = m1_edge_count;
     unsigned long lastTime1   = m1_last_time;
@@ -129,14 +146,14 @@ void loop() {
     unsigned long lastTime2   = m2_last_time;
     m2_total_duration = 0;
     m2_edge_count = 0;
-   
+
     interrupts();
 
     double i2 = 0, i1 = 0;
 
     // --- Motor 1 Average Speed Processing ---
     if (currentMicros - lastTime1 > TIMEOUT_US || lastTime1 == 0) {
-      i1 = 0; 
+      i1 = 0;
     } else if (count1 > 0) {
       float avg_edge_duration = (float)t_duration1 / count1;
       i1 = 60000000.0 / (avg_edge_duration * EDGES_PER_REV);
@@ -168,14 +185,14 @@ void loop() {
     Input2 = median3(m2_history[0], m2_history[1], m2_history[2]);
 
     // Convert Actual RPMs into actual MPH
-    float currentMPH1 = (Input1 * 31.416 * 60.0) / 63360.0;
-    float currentMPH2 = (Input2 * 31.416 * 60.0) / 63360.0;
+    float currentMPH1 = Input1 * MPH_PER_RPM;
+    float currentMPH2 = Input2 * MPH_PER_RPM;
 
     // --- Linked Safety Check ---
     if (currentMPH1 < MIN_ACTUAL_MPH || currentMPH2 < MIN_ACTUAL_MPH) {
       Output1 = 0;
       Output2 = 0;
-     
+
       if (myPID1.GetMode() == AUTOMATIC) {
         myPID1.SetMode(MANUAL);
         myPID2.SetMode(MANUAL);
@@ -192,7 +209,7 @@ void loop() {
     analogWrite(M2_PWM, Output2);
 
     // 5. Telemetry
-    float targetMPH = (Setpoint * 31.416 * 60.0) / 63360.0;
+    float targetMPH = Setpoint * MPH_PER_RPM;
     Serial.print("Target_MPH:"); Serial.print(targetMPH, 2);
     Serial.print(",M1_MPH:"); Serial.print(currentMPH1, 2);
     Serial.print(",M2_MPH:"); Serial.print(currentMPH2, 2);
